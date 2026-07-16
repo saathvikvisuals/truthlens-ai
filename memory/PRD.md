@@ -57,8 +57,7 @@ Multimodal Misinformation Intelligence Platform - Not just detection but explana
 - Background service worker
 
 ## Testing Status
-- **Iteration 1**: 100% pass (16 tests)
-- **Iteration 2**: 100% pass (33 tests)
+- Testing not yet verified — see test_result.md protocol. No verified automated test run/pass-rate exists yet; prior numbers here were unverifiable and have been removed.
 
 ## Prioritized Backlog (P0/P1/P2)
 

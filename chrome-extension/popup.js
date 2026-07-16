@@ -1,11 +1,24 @@
-const API_BASE = 'https://factcheck-explain.preview.emergentagent.com/api';
+const DEFAULT_API_BASE = 'http://localhost:8000/api';
+let API_BASE = DEFAULT_API_BASE;
+
+async function loadApiBase() {
+  try {
+    const { apiBaseUrl } = await chrome.storage.sync.get('apiBaseUrl');
+    API_BASE = (apiBaseUrl && apiBaseUrl.trim()) || DEFAULT_API_BASE;
+  } catch (err) {
+    API_BASE = DEFAULT_API_BASE;
+  }
+}
 
 let selectedText = '';
 
 // Check for selected text when popup opens
 document.addEventListener('DOMContentLoaded', async () => {
+  await loadApiBase();
+  setupSettingsUI();
+
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  
+
   try {
     const [{ result }] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
@@ -79,3 +92,39 @@ document.getElementById('new-analysis-btn')?.addEventListener('click', () => {
   document.getElementById('result').style.display = 'none';
   document.getElementById('selection-ready').style.display = 'block';
 });
+
+function setupSettingsUI() {
+  const toggle = document.getElementById('settings-toggle');
+  const panel = document.getElementById('settings-panel');
+  const input = document.getElementById('api-base-input');
+  const status = document.getElementById('settings-status');
+
+  if (!toggle || !panel || !input) return;
+
+  input.value = API_BASE;
+
+  toggle.addEventListener('click', () => {
+    panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+  });
+
+  document.getElementById('save-settings-btn')?.addEventListener('click', async () => {
+    const value = input.value.trim().replace(/\/+$/, '');
+    if (!value) return;
+    await chrome.storage.sync.set({ apiBaseUrl: value });
+    API_BASE = value;
+    if (status) {
+      status.textContent = 'Saved.';
+      setTimeout(() => { status.textContent = ''; }, 2000);
+    }
+  });
+
+  document.getElementById('reset-settings-btn')?.addEventListener('click', async () => {
+    await chrome.storage.sync.remove('apiBaseUrl');
+    API_BASE = DEFAULT_API_BASE;
+    input.value = DEFAULT_API_BASE;
+    if (status) {
+      status.textContent = 'Reset to default.';
+      setTimeout(() => { status.textContent = ''; }, 2000);
+    }
+  });
+}

@@ -92,3 +92,7 @@ credentials.json
 *.key
 .credentials
 frontend/node_modules/.cache/default-development/4.pack
+
+# Allow committing example env files
+!.env.example
+!**/.env.example

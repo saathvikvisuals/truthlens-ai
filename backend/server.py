@@ -1,11 +1,15 @@
-from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException
+from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import certifi
 import os
 import logging
+import time
+import threading
+from collections import deque
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Dict, Any
@@ -13,10 +17,15 @@ import uuid
 from datetime import datetime, timezone
 import base64
 import io
+import copy
+import tempfile
 from PIL import Image
 import cv2
 import numpy as np
-from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
+try:
+    from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
+except ModuleNotFoundError:
+    from backend.emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
 import json
 import aiohttp
 import asyncio
@@ -30,37 +39,106 @@ from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.enums import TA_LEFT, TA_CENTER
 from fastapi.responses import Response
+try:
+    from graph_store import graph_store
+except ModuleNotFoundError:
+    from backend.graph_store import graph_store
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 mongo_url = os.environ.get('MONGO_URL')
-if not mongo_url:
-    raise RuntimeError(
-        'MONGO_URL environment variable is required. Set it in Render service environment variables.'
-    )
-
-db_name = os.environ.get('DB_NAME')
-if not db_name:
-    raise RuntimeError(
-        'DB_NAME environment variable is required. Set it in Render service environment variables.'
-    )
+db_name = os.environ.get('DB_NAME') or 'truthlens_local'
+mongo_enabled = bool(mongo_url)
 
 mongo_server_selection_timeout_ms = int(
     os.environ.get('MONGO_SERVER_SELECTION_TIMEOUT_MS', '5000')
 )
 mongo_socket_timeout_ms = int(os.environ.get('MONGO_SOCKET_TIMEOUT_MS', '10000'))
 
-client = AsyncIOMotorClient(
-    mongo_url,
-    tlsCAFile=os.environ.get('MONGO_TLS_CA_FILE') or certifi.where(),
-    serverSelectionTimeoutMS=mongo_server_selection_timeout_ms,
-    connectTimeoutMS=mongo_server_selection_timeout_ms,
-    socketTimeoutMS=mongo_socket_timeout_ms,
-)
-db = client[db_name]
+client = None
+db = None
+if mongo_enabled:
+    mongo_client_options = {
+        "serverSelectionTimeoutMS": mongo_server_selection_timeout_ms,
+        "connectTimeoutMS": mongo_server_selection_timeout_ms,
+        "socketTimeoutMS": mongo_socket_timeout_ms,
+    }
+    mongo_tls_ca_file = os.environ.get('MONGO_TLS_CA_FILE')
+    if mongo_tls_ca_file:
+        mongo_client_options["tlsCAFile"] = mongo_tls_ca_file
+    elif mongo_url.startswith("mongodb+srv://"):
+        mongo_client_options["tlsCAFile"] = certifi.where()
+
+    client = AsyncIOMotorClient(
+        mongo_url,
+        **mongo_client_options,
+    )
+    db = client[db_name]
 
 EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
+in_memory_analyses: List[Dict[str, Any]] = []
+in_memory_claims: List[Dict[str, Any]] = []
+
+# ========== AUTH ==========
+API_KEY = os.environ.get('API_KEY', '')
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def require_api_key(x_api_key: Optional[str] = Depends(_api_key_header)) -> None:
+    """Minimal API-key gate for paid/expensive endpoints.
+
+    If API_KEY is unset in the environment, auth is treated as not configured
+    and requests are allowed through (dev/demo mode) but a warning is logged
+    once at startup. Set API_KEY in production to enforce the check.
+    """
+    if not API_KEY:
+        return
+    if not x_api_key or x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key header")
+
+
+# ========== RATE LIMITING ==========
+RATE_LIMIT_PER_MINUTE = int(os.environ.get('RATE_LIMIT_PER_MINUTE', '20'))
+_rate_limit_buckets: Dict[str, deque] = {}
+_rate_limit_lock = threading.Lock()
+
+
+def _rate_limit_key(request: Request, x_api_key: Optional[str]) -> str:
+    if x_api_key:
+        return f"key:{x_api_key}"
+    client_host = request.client.host if request.client else "unknown"
+    return f"ip:{client_host}"
+
+
+async def rate_limiter(request: Request, x_api_key: Optional[str] = Depends(_api_key_header)) -> None:
+    """Simple in-memory sliding-window rate limiter keyed by API key or client IP.
+
+    Configurable via RATE_LIMIT_PER_MINUTE env var. Applied to the
+    expensive analyze-* routes, which call paid LLM APIs.
+    """
+    if RATE_LIMIT_PER_MINUTE <= 0:
+        return
+
+    key = _rate_limit_key(request, x_api_key)
+    now = time.monotonic()
+    window_seconds = 60.0
+
+    with _rate_limit_lock:
+        bucket = _rate_limit_buckets.setdefault(key, deque())
+        while bucket and now - bucket[0] > window_seconds:
+            bucket.popleft()
+
+        if len(bucket) >= RATE_LIMIT_PER_MINUTE:
+            retry_after = max(1, int(window_seconds - (now - bucket[0])))
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded ({RATE_LIMIT_PER_MINUTE} requests/min). Try again later.",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+        bucket.append(now)
+
 
 # FastAPI App
 app = FastAPI(title="Truthlens API")
@@ -93,6 +171,10 @@ async def health_check():
             "ready": app.state.db_ready,
             "status": app.state.db_status,
             "error": app.state.db_error,
+        },
+        "graph_database": {
+            "backend": "neo4j",
+            "enabled": graph_store.enabled,
         }
     }
 
@@ -166,6 +248,19 @@ async def persist_analysis_result(
     doc = analysis_obj.model_dump()
     doc['timestamp'] = doc['timestamp'].isoformat()
 
+    if db is None:
+        in_memory_analyses.append(copy.deepcopy(doc))
+        for claim in claims or []:
+            in_memory_claims.append({
+                "id": str(uuid.uuid4()),
+                "claim_text": claim.get('claim', ''),
+                "verdict": "Verified" if (claim.get('verification') or {}).get('wikipedia_found') else "Unverified",
+                "confidence": analysis_obj.credibility_score,
+                "analysis_id": analysis_obj.id,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+        return True
+
     try:
         await db.analyses.insert_one(doc)
 
@@ -173,7 +268,7 @@ async def persist_analysis_result(
             claim_record = {
                 "id": str(uuid.uuid4()),
                 "claim_text": claim.get('claim', ''),
-                "verdict": "Verified" if claim.get('verification', {}).get('wikipedia_found') else "Unverified",
+                "verdict": "Verified" if (claim.get('verification') or {}).get('wikipedia_found') else "Unverified",
                 "confidence": analysis_obj.credibility_score,
                 "analysis_id": analysis_obj.id,
                 "timestamp": datetime.now(timezone.utc).isoformat()
@@ -192,6 +287,13 @@ async def persist_analysis_result(
 
 
 async def safe_update_analysis(analysis_id: str, updates: Dict[str, Any]) -> bool:
+    if db is None:
+        for analysis in in_memory_analyses:
+            if analysis.get("id") == analysis_id:
+                analysis.update(copy.deepcopy(updates))
+                return True
+        return False
+
     try:
         await db.analyses.update_one({"id": analysis_id}, {"$set": updates})
         return True
@@ -214,6 +316,13 @@ async def initialize_database() -> None:
     """Ensure MongoDB is reachable and required collections/indexes exist."""
     analyses_collection = "analyses"
     claims_collection = "claims"
+
+    if db is None or client is None:
+        app.state.db_ready = True
+        app.state.db_status = "in_memory"
+        app.state.db_error = None
+        logger.info("MongoDB is not configured; using in-memory local persistence.")
+        return
 
     try:
         await client.admin.command("ping")
@@ -401,6 +510,34 @@ def calculate_weighted_ensemble(ai_results: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def has_successful_provider_result(ai_results: Dict[str, Any]) -> bool:
+    for provider, result in ai_results.items():
+        if provider == "technical_analysis":
+            continue
+        if isinstance(result, dict) and "error" not in result:
+            return True
+    return False
+
+
+def require_ai_provider_result(ai_results: Dict[str, Any], operation: str) -> None:
+    if has_successful_provider_result(ai_results):
+        return
+
+    errors = [
+        f"{provider}: {result.get('error')}"
+        for provider, result in ai_results.items()
+        if provider != "technical_analysis" and isinstance(result, dict) and result.get("error")
+    ]
+    detail = (
+        f"{operation} requires at least one configured AI provider. "
+        "Set OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY/GOOGLE_API_KEY, "
+        "or EMERGENT_LLM_KEY."
+    )
+    if errors:
+        detail = f"{detail} Provider errors: {' | '.join(errors[:3])}"
+    raise HTTPException(status_code=503, detail=detail)
+
+
 # ========== AI ANALYSIS ==========
 async def analyze_text_with_ai(text: str) -> Dict[str, Any]:
     """Analyze text using multiple AI providers"""
@@ -520,10 +657,10 @@ async def analyze_image_with_ai(image_base64: str) -> Dict[str, Any]:
                 )
             ).with_model("openai", "gpt-4-turbo")
             
-            response = await chat.send_message(UserMessage(
-                text="Analyze this image for manipulation.",
+            response = await chat.send_message(
+                UserMessage(text="Analyze this image for manipulation."),
                 file_contents=[ImageContent(image_base64=image_base64)]
-            ))
+            )
             clean = response.strip().replace("```json", "").replace("```", "").strip()
             return json.loads(clean)
         except Exception as e:
@@ -541,10 +678,10 @@ async def analyze_image_with_ai(image_base64: str) -> Dict[str, Any]:
                 )
             ).with_model("gemini", "gemini-2.0-flash")
             
-            response = await chat.send_message(UserMessage(
-                text="Examine this image for manipulation.",
+            response = await chat.send_message(
+                UserMessage(text="Examine this image for manipulation."),
                 file_contents=[ImageContent(image_base64=image_base64)]
-            ))
+            )
             clean = response.strip().replace("```json", "").replace("```", "").strip()
             return json.loads(clean)
         except Exception as e:
@@ -587,8 +724,9 @@ def generate_knowledge_graph(text: str, ai_results: Dict[str, Any], claims: List
         })
         
         # Add Wikipedia sources
-        if 'verification' in claim and claim['verification'].get('sources'):
-            for j, src in enumerate(claim['verification']['sources'][:2]):
+        verification = claim.get('verification') or {}
+        if verification.get('sources'):
+            for j, src in enumerate(verification['sources'][:2]):
                 src_id = f"src_{i}_{j}"
                 nodes.append({
                     "id": src_id,
@@ -604,15 +742,19 @@ def generate_knowledge_graph(text: str, ai_results: Dict[str, Any], claims: List
     return {"nodes": nodes, "links": links}
 
 
-@api_router.post("/analyze-text", response_model=AnalysisResult)
+@api_router.post("/analyze-text", response_model=AnalysisResult, dependencies=[Depends(require_api_key), Depends(rate_limiter)])
 async def analyze_text(request: TextAnalysisRequest):
     """Enhanced text analysis with weighted ensemble, claim extraction, and source verification"""
+    if not request.text.strip():
+        raise HTTPException(status_code=400, detail="Text content is required")
+
     try:
         # Run AI analysis and claim extraction in parallel
         ai_task = analyze_text_with_ai(request.text)
         claims_task = extract_claims_from_text(request.text) if request.extract_claims else asyncio.sleep(0, result=[])
         
         ai_results, raw_claims = await asyncio.gather(ai_task, claims_task)
+        require_ai_provider_result(ai_results, "Text analysis")
         
         # Verify claims if enabled
         verified_claims = []
@@ -630,7 +772,11 @@ async def analyze_text(request: TextAnalysisRequest):
         
         # Boost/reduce score based on source verification
         if verified_claims:
-            verified_count = sum(1 for c in verified_claims if c.get('verification', {}).get('wikipedia_found'))
+            verified_count = sum(
+                1
+                for c in verified_claims
+                if (c.get('verification') or {}).get('wikipedia_found')
+            )
             if verified_count > 0:
                 credibility_score = min(100, credibility_score + (verified_count * 3))
         
@@ -665,13 +811,33 @@ async def analyze_text(request: TextAnalysisRequest):
                                 "reason": f"Flagged by {provider} ({key.replace('_', ' ')})"
                             })
         
-        # Knowledge graph
-        knowledge_graph = generate_knowledge_graph(request.text, ai_results, verified_claims)
-        
+        # Knowledge graph: write real claim/source/provider relationships into
+        # Neo4j (best-effort, never blocks the response), then read the graph
+        # rooted at this analysis back out for the frontend. Falls back to the
+        # static in-memory shape when Neo4j isn't configured.
+        analysis_id = str(uuid.uuid4())
+        provider_scores = ensemble.get('provider_scores', {})
+        await graph_store.write_analysis(
+            analysis_id=analysis_id,
+            content_type="text",
+            content_preview=request.text,
+            credibility_score=credibility_score,
+            prediction=prediction,
+            provider_scores=provider_scores,
+            claims=verified_claims,
+        )
+        knowledge_graph = await graph_store.subgraph_for_analysis(analysis_id)
+        if not knowledge_graph or not knowledge_graph.get("nodes"):
+            knowledge_graph = generate_knowledge_graph(request.text, ai_results, verified_claims)
+
         # Source verification summary
         source_verification = None
         if verified_claims:
-            verified_count = sum(1 for c in verified_claims if c.get('verification', {}).get('wikipedia_found'))
+            verified_count = sum(
+                1
+                for c in verified_claims
+                if (c.get('verification') or {}).get('wikipedia_found')
+            )
             source_verification = {
                 "total_claims": len(verified_claims),
                 "verified": verified_count,
@@ -679,6 +845,7 @@ async def analyze_text(request: TextAnalysisRequest):
             }
         
         analysis_obj = AnalysisResult(
+            id=analysis_id,
             content_type="text",
             content=request.text[:500],
             credibility_score=credibility_score,
@@ -700,12 +867,14 @@ async def analyze_text(request: TextAnalysisRequest):
         
         return analysis_obj
     
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Error in text analysis: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@api_router.post("/analyze-image")
+@api_router.post("/analyze-image", dependencies=[Depends(require_api_key), Depends(rate_limiter)])
 async def analyze_image(file: UploadFile = File(...)):
     """Analyze image for manipulation and deepfakes"""
     try:
@@ -713,6 +882,7 @@ async def analyze_image(file: UploadFile = File(...)):
         image_base64 = base64.b64encode(contents).decode('utf-8')
         
         ai_results = await analyze_image_with_ai(image_base64)
+        require_ai_provider_result(ai_results, "Image analysis")
         
         # Technical analysis
         image = Image.open(io.BytesIO(contents))
@@ -767,51 +937,61 @@ async def analyze_image(file: UploadFile = File(...)):
         
         return analysis_obj
     
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Error in image analysis: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@api_router.post("/analyze-video")
+@api_router.post("/analyze-video", dependencies=[Depends(require_api_key), Depends(rate_limiter)])
 async def analyze_video(file: UploadFile = File(...)):
     """Analyze video for deepfakes"""
     try:
         contents = await file.read()
         
-        temp_path = f"/tmp/{uuid.uuid4()}.mp4"
-        with open(temp_path, "wb") as f:
-            f.write(contents)
-        
-        cap = cv2.VideoCapture(temp_path)
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        temp_path = temp_file.name
         frame_analyses = []
         frame_count = 0
         suspicious_frames = []
-        
-        while cap.isOpened() and frame_count < 10:
-            ret, frame = cap.read()
-            if not ret:
-                break
+
+        try:
+            temp_file.write(contents)
+            temp_file.close()
+
+            cap = cv2.VideoCapture(temp_path)
             
-            if frame_count % 30 == 0:
-                _, buffer = cv2.imencode('.jpg', frame)
-                frame_base64 = base64.b64encode(buffer).decode('utf-8')
+            while cap.isOpened() and frame_count < 10:
+                ret, frame = cap.read()
+                if not ret:
+                    break
                 
-                frame_ai_results = await analyze_image_with_ai(frame_base64)
-                frame_ensemble = calculate_weighted_ensemble(frame_ai_results)
-                frame_score = frame_ensemble['weighted_score']
+                if frame_count % 30 == 0:
+                    _, buffer = cv2.imencode('.jpg', frame)
+                    frame_base64 = base64.b64encode(buffer).decode('utf-8')
+                    
+                    frame_ai_results = await analyze_image_with_ai(frame_base64)
+                    require_ai_provider_result(frame_ai_results, "Video frame analysis")
+                    frame_ensemble = calculate_weighted_ensemble(frame_ai_results)
+                    frame_score = frame_ensemble['weighted_score']
+                    
+                    frame_analyses.append({
+                        "frame_number": frame_count,
+                        "score": frame_score
+                    })
+                    
+                    if frame_score < 50:
+                        suspicious_frames.append(frame_count)
                 
-                frame_analyses.append({
-                    "frame_number": frame_count,
-                    "score": frame_score
-                })
-                
-                if frame_score < 50:
-                    suspicious_frames.append(frame_count)
+                frame_count += 1
             
-            frame_count += 1
-        
-        cap.release()
-        os.remove(temp_path)
+            cap.release()
+        finally:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                logging.warning("Failed to remove temporary video file: %s", temp_path)
         
         if frame_analyses:
             avg_score = sum(f['score'] for f in frame_analyses) / len(frame_analyses)
@@ -857,6 +1037,17 @@ async def analyze_video(file: UploadFile = File(...)):
 
 @api_router.get("/analysis/{analysis_id}", response_model=AnalysisResult)
 async def get_analysis(analysis_id: str):
+    if db is None:
+        result = next(
+            (copy.deepcopy(item) for item in in_memory_analyses if item.get("id") == analysis_id),
+            None
+        )
+        if not result:
+            raise HTTPException(status_code=404, detail="Analysis not found")
+        if isinstance(result['timestamp'], str):
+            result['timestamp'] = datetime.fromisoformat(result['timestamp'])
+        return result
+
     try:
         result = await db.analyses.find_one({"id": analysis_id}, {"_id": 0})
     except Exception as exc:
@@ -874,12 +1065,19 @@ async def get_analysis(analysis_id: str):
 
 @api_router.get("/history", response_model=List[AnalysisHistory])
 async def get_history(limit: int = 20):
-    try:
-        results = await db.analyses.find({}, {"_id": 0}).sort("timestamp", -1).limit(limit).to_list(limit)
-    except Exception as exc:
-        logging.warning("Failed to load analysis history: %s", exc, exc_info=True)
-        return []
-    
+    if db is None:
+        results = sorted(
+            (copy.deepcopy(item) for item in in_memory_analyses),
+            key=lambda item: item.get("timestamp", ""),
+            reverse=True
+        )[:limit]
+    else:
+        try:
+            results = await db.analyses.find({}, {"_id": 0}).sort("timestamp", -1).limit(limit).to_list(limit)
+        except Exception as exc:
+            logging.warning("Failed to load analysis history: %s", exc, exc_info=True)
+            return []
+
     history = []
     for result in results:
         if isinstance(result['timestamp'], str):
@@ -895,10 +1093,16 @@ async def get_history(limit: int = 20):
     
     return history
 
-
 @api_router.get("/claims/recent")
 async def get_recent_claims(limit: int = 20):
     """Get recently tracked claims"""
+    if db is None:
+        return sorted(
+            (copy.deepcopy(item) for item in in_memory_claims),
+            key=lambda item: item.get("timestamp", ""),
+            reverse=True
+        )[:limit]
+
     try:
         results = await db.claims.find({}, {"_id": 0}).sort("timestamp", -1).limit(limit).to_list(limit)
         return results
@@ -907,9 +1111,48 @@ async def get_recent_claims(limit: int = 20):
         return []
 
 
-@api_router.get("/stats")
+@api_router.get("/graph/stats")
+async def get_graph_stats():
+    """Node/relationship counts from the Neo4j knowledge graph."""
+    return await graph_store.stats()
+
+
+@api_router.get("/graph/related-claims")
+async def get_related_claims(claim: str, limit: int = 5):
+    """Claims that share at least one verification source with the given claim,
+    found via a real 2-hop graph traversal (Claim -> Source <- Claim) rather than
+    a lookup table. Surfaces recurring misinformation clusters across analyses."""
+    if not claim.strip():
+        raise HTTPException(status_code=400, detail="claim query parameter is required")
+    related = await graph_store.related_claims(claim, limit=limit)
+    return {"claim": claim, "related": related, "graph_enabled": graph_store.enabled}
+
+
+@api_router.get("/stats", dependencies=[Depends(require_api_key)])
 async def get_stats():
     """Get platform statistics"""
+    if db is None:
+        prediction_counts = {}
+        type_counts = {}
+        for analysis in in_memory_analyses:
+            prediction = analysis.get("prediction", "Unknown")
+            content_type = analysis.get("content_type", "unknown")
+            prediction_counts[prediction] = prediction_counts.get(prediction, 0) + 1
+            type_counts[content_type] = type_counts.get(content_type, 0) + 1
+
+        return {
+            "total_analyses": len(in_memory_analyses),
+            "total_claims_tracked": len(in_memory_claims),
+            "prediction_distribution": [
+                {"label": label, "count": count}
+                for label, count in prediction_counts.items()
+            ],
+            "content_type_distribution": [
+                {"label": label, "count": count}
+                for label, count in type_counts.items()
+            ]
+        }
+
     try:
         total_analyses = await db.analyses.count_documents({})
         total_claims = await db.claims.count_documents({})
@@ -940,7 +1183,7 @@ async def get_stats():
         }
 
 
-@api_router.post("/analyze-url", response_model=AnalysisResult)
+@api_router.post("/analyze-url", response_model=AnalysisResult, dependencies=[Depends(require_api_key), Depends(rate_limiter)])
 async def analyze_url(request: UrlAnalysisRequest):
     """Fetch and analyze content from a URL"""
     try:
@@ -1012,7 +1255,7 @@ async def analyze_url(request: UrlAnalysisRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@api_router.post("/analyze-pdf", response_model=AnalysisResult)
+@api_router.post("/analyze-pdf", response_model=AnalysisResult, dependencies=[Depends(require_api_key), Depends(rate_limiter)])
 async def analyze_pdf(file: UploadFile = File(...)):
     """Analyze a PDF document for misinformation"""
     try:
@@ -1068,11 +1311,17 @@ async def analyze_pdf(file: UploadFile = File(...)):
 async def export_pdf(analysis_id: str):
     """Export analysis report as PDF"""
     try:
-        try:
-            result = await db.analyses.find_one({"id": analysis_id}, {"_id": 0})
-        except Exception as exc:
-            logging.warning("Failed to load analysis %s for PDF export: %s", analysis_id, exc, exc_info=True)
-            raise HTTPException(status_code=503, detail="Database temporarily unavailable")
+        if db is None:
+            result = next(
+                (copy.deepcopy(item) for item in in_memory_analyses if item.get("id") == analysis_id),
+                None
+            )
+        else:
+            try:
+                result = await db.analyses.find_one({"id": analysis_id}, {"_id": 0})
+            except Exception as exc:
+                logging.warning("Failed to load analysis %s for PDF export: %s", analysis_id, exc, exc_info=True)
+                raise HTTPException(status_code=503, detail="Database temporarily unavailable")
 
         if not result:
             raise HTTPException(status_code=404, detail="Analysis not found")
@@ -1256,6 +1505,10 @@ async def root():
 
 app.include_router(api_router)
 
+# WARNING: never leave CORS_ORIGINS unset/`*` in production — combined with
+# allow_credentials=True this permits any website to make authenticated
+# cross-origin requests to this API. Set CORS_ORIGINS to a comma-separated
+# list of exact trusted origins (e.g. https://yourapp.com) in the real .env.
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -1273,7 +1526,10 @@ logger = logging.getLogger(__name__)
 @app.on_event("startup")
 async def startup_db_client():
     await initialize_database()
+    await graph_store.connect()
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    if client is not None:
+        client.close()
+    await graph_store.close()
